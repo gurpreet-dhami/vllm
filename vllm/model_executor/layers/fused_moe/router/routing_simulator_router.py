@@ -222,6 +222,80 @@ class DistributionBasedRouting(RoutingStrategy):
         }
 
 
+class PerfectlyBalancedRouting(RoutingStrategy):
+    """
+    Runs the standard routing logic (top-k on router_logits), then discards the
+    result and overrides with deterministic round-robin for perfectly balanced
+    load across experts. Each expert receives exactly
+    (num_tokens * top_k) / num_experts assignments.
+    Use for benchmarking theoretical best EP performance while still executing
+    the routing computation.
+    """
+
+    def route_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        indices_type: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        num_experts = router_logits.shape[-1]
+        device = hidden_states.device
+
+        if indices_type is None:
+            indices_type = torch.long
+
+        # 1. Run standard routing logic (top-k on router_logits), then discard
+        _topk_values, _topk_ids = torch.topk(router_logits, k=top_k, dim=-1)
+
+        # 2. Override with perfectly balanced round-robin
+        token_idx = torch.arange(num_tokens, device=device).unsqueeze(1)
+        slot_idx = torch.arange(top_k, device=device).unsqueeze(0)
+        topk_ids = (token_idx * top_k + slot_idx) % num_experts
+        topk_ids = topk_ids.to(indices_type)
+
+        topk_weights = (
+            torch.ones((num_tokens, top_k), dtype=torch.float32, device=device)
+            / top_k
+        )
+        return topk_weights, topk_ids
+
+
+class PerfectlyImbalancedRouting(RoutingStrategy):
+    """
+    Route all tokens to the same top_k experts (0, 1, ..., top_k-1).
+    Creates maximum load imbalance: one GPU gets all load when experts
+    are placed linearly. Use for stress-testing worst-case EP performance
+    and EPLB behavior under extreme imbalance.
+    """
+
+    def route_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        indices_type: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        device = hidden_states.device
+
+        if indices_type is None:
+            indices_type = torch.long
+
+        # All tokens route to experts [0, 1, ..., top_k-1]
+        topk_ids = torch.arange(top_k, device=device).unsqueeze(0).expand(
+            num_tokens, -1
+        )
+        topk_ids = topk_ids.to(indices_type)
+
+        topk_weights = (
+            torch.ones((num_tokens, top_k), dtype=torch.float32, device=device)
+            / top_k
+        )
+        return topk_weights, topk_ids
+
+
 class RoutingSimulator:
     """
     Token-to-Expert Routing Simulator.
@@ -240,6 +314,9 @@ class RoutingSimulator:
         "normal_routing": DistributionBasedRouting(
             distribution="normal", mean=0.0, std=1.0
         ),
+        # Deterministic strategies for benchmarking
+        "perfectly_balanced": PerfectlyBalancedRouting(),
+        "perfectly_imbalanced": PerfectlyImbalancedRouting(),
     }
 
     @classmethod

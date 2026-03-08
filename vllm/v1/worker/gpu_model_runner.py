@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -2644,8 +2645,19 @@ class GPUModelRunner(
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """
         Step for the EPLB (Expert Parallelism Load Balancing) state.
+        Also steps for EP-only balancedness dump when EPLB disabled + VLLM_EP_DUMP_BALANCEDNESS=1.
         """
         if not self.parallel_config.enable_eplb:
+            # EP-only: eplb_state exists for balancedness dump when EPLB disabled
+            if (
+                self.eplb_state is not None
+                and os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+            ):
+                self.eplb_state.step(
+                    is_dummy,
+                    is_profile,
+                    log_stats=True,
+                )
             return
 
         assert self.eplb_state is not None
@@ -4260,6 +4272,25 @@ class GPUModelRunner(
             )
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop(rank_mapping=rank_mapping)
+        elif (
+            is_mixture_of_experts(self.model)
+            and self.parallel_config.enable_expert_parallel
+            and not self.parallel_config.enable_eplb
+            and os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+        ):
+            # EP-only balancedness dump when EPLB disabled
+            self.eplb_state = EplbState(self.parallel_config, self.device)
+            self.eplb_state.add_model(
+                self.model,
+                self.model_config,
+                None,
+                None,
+                None,
+            )
+            logger.info_once(
+                "EP balancedness dump enabled for model %s (EPLB disabled).",
+                self.model_config.model,
+            )
 
         if (
             self.vllm_config.compilation_config.mode

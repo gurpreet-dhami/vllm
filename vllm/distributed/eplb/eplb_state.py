@@ -26,6 +26,8 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import csv
+import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.distributed.parallel_state import (
     get_ep_group,
@@ -53,6 +56,41 @@ from .rebalance_execute import (
 )
 
 logger = init_logger(__name__)
+
+
+def _dump_balancedness_to_file(
+    step: int,
+    model_name: str,
+    avg_tokens: float,
+    max_tokens: float,
+    balancedness: float,
+    eplb_enabled: bool,
+) -> None:
+    """Dump balancedness, avg_tokens and max_tokens when VLLM_EP_DUMP_BALANCEDNESS is set."""
+    if not envs.VLLM_EP_DUMP_BALANCEDNESS:
+        return
+    dump_to_console = envs.VLLM_EP_DUMP_TO_CONSOLE
+    if dump_to_console:
+        import sys
+        w = csv.writer(sys.stdout)
+        if not getattr(_dump_balancedness_to_file, "_header_printed", False):
+            w.writerow(["step", "model", "avg_tokens", "max_tokens", "balancedness", "eplb_enabled"])
+            _dump_balancedness_to_file._header_printed = True
+        w.writerow([step, model_name, avg_tokens, max_tokens, balancedness, eplb_enabled])
+        sys.stdout.flush()
+        return
+    dump_file = envs.VLLM_EP_DUMP_FILE
+    if not dump_file:
+        return
+    try:
+        write_header = not (os.path.exists(dump_file) and os.path.getsize(dump_file) > 0)
+        with open(dump_file, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["step", "model", "avg_tokens", "max_tokens", "balancedness", "eplb_enabled"])
+            w.writerow([step, model_name, avg_tokens, max_tokens, balancedness, eplb_enabled])
+    except OSError as e:
+        logger.warning("Failed to dump balancedness to %s: %s", dump_file, e)
 
 
 @dataclass
@@ -637,6 +675,15 @@ class EplbState:
                 avg_tokens, max_tokens = tokens_tensors
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
+                if ep_group.rank() == 0:
+                    _dump_balancedness_to_file(
+                        self.expert_rearrangement_step,
+                        eplb_model_state.model_name,
+                        avg_tokens,
+                        max_tokens,
+                        balancedness,
+                        eplb_enabled=self.parallel_config.enable_eplb,
+                    )
                 if ep_group.rank() == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "

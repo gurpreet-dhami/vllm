@@ -165,6 +165,22 @@ class BaseRouter(FusedMoERouter):
                 logical_to_physical_map=self.eplb_state.logical_to_physical_map,
                 logical_replica_count=self.eplb_state.logical_replica_count,
             )
+        # EP-only: record load for balancedness dump when EPLB disabled
+        if (
+            not self.enable_eplb
+            and self.eplb_state is not None
+            and self.eplb_state.expert_load_view is not None
+            and self.eplb_state.logical_to_physical_map is not None
+            and self.eplb_state.logical_replica_count is not None
+        ):
+            import os
+            if os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1":
+                return eplb_map_to_physical_and_record(
+                    topk_ids=topk_ids,
+                    expert_load_view=self.eplb_state.expert_load_view,
+                    logical_to_physical_map=self.eplb_state.logical_to_physical_map,
+                    logical_replica_count=self.eplb_state.logical_replica_count,
+                )
         return topk_ids
 
     def _convert_indices_dtype(

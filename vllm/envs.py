@@ -233,6 +233,9 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_EP_DUMP_BALANCEDNESS: bool = False
+    VLLM_EP_DUMP_FILE: str | None = None
+    VLLM_EP_DUMP_TO_CONSOLE: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1564,6 +1567,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
+    ),
+    "VLLM_EP_DUMP_BALANCEDNESS": lambda: bool(
+        int(os.getenv("VLLM_EP_DUMP_BALANCEDNESS", "0"))
+    ),
+    "VLLM_EP_DUMP_FILE": lambda: os.environ.get(
+        "VLLM_EP_DUMP_FILE", "vllm_ep_balancedness_dump.csv"
+    ),
+    "VLLM_EP_DUMP_TO_CONSOLE": lambda: bool(
+        int(os.getenv("VLLM_EP_DUMP_TO_CONSOLE", "0"))
     ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
