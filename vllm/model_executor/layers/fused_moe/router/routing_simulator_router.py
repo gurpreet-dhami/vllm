@@ -284,10 +284,12 @@ class PerfectlyImbalancedRouting(RoutingStrategy):
             indices_type = torch.long
 
         # All tokens route to experts [0, 1, ..., top_k-1]
+        # .contiguous() required: expand() creates non-contiguous view, DeepEP
+        # backend asserts topk_idx.is_contiguous()
         topk_ids = torch.arange(top_k, device=device).unsqueeze(0).expand(
             num_tokens, -1
         )
-        topk_ids = topk_ids.to(indices_type)
+        topk_ids = topk_ids.to(indices_type).contiguous()
 
         topk_weights = (
             torch.ones((num_tokens, top_k), dtype=torch.float32, device=device)
