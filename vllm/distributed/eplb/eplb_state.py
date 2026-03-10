@@ -733,10 +733,11 @@ class EplbState:
                                 dtype=expert_load_pass.dtype,
                                 device=expert_load_pass.device,
                             )
+                            layer_load = expert_load_pass[layer_id]
                             logical_load.scatter_add_(
                                 0,
                                 phys_to_log[layer_id].long(),
-                                expert_load_pass[layer_id].float(),
+                                layer_load.to(logical_load.dtype),
                             )
                             hot_expert_mask = (
                                 (logical_load > 0).int().cpu().tolist()
