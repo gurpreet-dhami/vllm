@@ -60,13 +60,11 @@ logger = init_logger(__name__)
 
 def _dump_balancedness_to_file(
     step: int,
-    model_name: str,
-    avg_tokens: float,
-    max_tokens: float,
     balancedness: float,
-    eplb_enabled: bool,
 ) -> None:
-    """Dump balancedness, avg_tokens and max_tokens when VLLM_EP_DUMP_BALANCEDNESS is set."""
+    """Dump the aggregated balancedness (same as logged) when VLLM_EP_DUMP_BALANCEDNESS is set.
+    Format: time, balancedness.
+    """
     if not envs.VLLM_EP_DUMP_BALANCEDNESS:
         return
     dump_to_console = envs.VLLM_EP_DUMP_TO_CONSOLE
@@ -74,12 +72,12 @@ def _dump_balancedness_to_file(
         import sys
         w = csv.writer(sys.stdout)
         if not getattr(_dump_balancedness_to_file, "_header_printed", False):
-            w.writerow(["step", "model", "avg_tokens", "max_tokens", "balancedness", "eplb_enabled"])
+            w.writerow(["time", "balancedness"])
             _dump_balancedness_to_file._header_printed = True
-        w.writerow([step, model_name, avg_tokens, max_tokens, balancedness, eplb_enabled])
+        w.writerow([step, balancedness])
         sys.stdout.flush()
         return
-    dump_file = envs.VLLM_EP_DUMP_FILE
+    dump_file = envs.VLLM_EP_DUMP_BALANCEDNESS_FILE
     if not dump_file:
         return
     try:
@@ -87,10 +85,33 @@ def _dump_balancedness_to_file(
         with open(dump_file, "a", newline="") as f:
             w = csv.writer(f)
             if write_header:
-                w.writerow(["step", "model", "avg_tokens", "max_tokens", "balancedness", "eplb_enabled"])
-            w.writerow([step, model_name, avg_tokens, max_tokens, balancedness, eplb_enabled])
+                w.writerow(["time", "balancedness"])
+            w.writerow([step, balancedness])
     except OSError as e:
         logger.warning("Failed to dump balancedness to %s: %s", dump_file, e)
+
+
+def _dump_hot_experts_to_file(
+    step: int,
+    layer_id: int,
+    hot_expert_ids: Sequence[int],
+) -> None:
+    """Dump hot experts per layer when VLLM_EP_DUMP_HOT_EXPERTS_FILE is set.
+    Format: time, layer_id, all hot experts (comma-separated).
+    """
+    dump_file = envs.VLLM_EP_DUMP_HOT_EXPERTS_FILE
+    if not dump_file:
+        return
+    try:
+        write_header = not (os.path.exists(dump_file) and os.path.getsize(dump_file) > 0)
+        with open(dump_file, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(["time", "layer_id", "hot_experts"])
+            hot_experts_str = ",".join(str(e) for e in hot_expert_ids)
+            w.writerow([step, layer_id, hot_experts_str])
+    except OSError as e:
+        logger.warning("Failed to dump hot experts to %s: %s", dump_file, e)
 
 
 @dataclass
@@ -662,32 +683,22 @@ class EplbState:
                     .float()
                 )
 
-                # Compute balancedness ratio:
-                # for each layer:
-                #   (mean load across ranks) / (max load across ranks)
-                avg_tokens_tensor = num_tokens_per_rank.mean(dim=0).sum(dim=0)
-                max_tokens_tensor = num_tokens_per_rank.max(dim=0).values.sum(dim=0)
-
-                # Just to make type checker happy
-                tokens_tensors: list[float] = torch.stack(
-                    [avg_tokens_tensor, max_tokens_tensor]
-                ).tolist()
-                avg_tokens, max_tokens = tokens_tensors
-                balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
+                # Total tokens per rank (summed over all MoE layers)
+                per_rank_total = num_tokens_per_rank.sum(dim=0)  # (num_ranks,)
+                avg_tokens = per_rank_total.mean().item()
+                max_tokens = per_rank_total.max().item()
+                balancedness = (
+                    avg_tokens / max_tokens if max_tokens > 0 else 0.0
+                )
 
                 if ep_group.rank() == 0:
                     _dump_balancedness_to_file(
-                        self.expert_rearrangement_step,
-                        eplb_model_state.model_name,
-                        avg_tokens,
-                        max_tokens,
-                        balancedness,
-                        eplb_enabled=self.parallel_config.enable_eplb,
+                        self.expert_rearrangement_step, balancedness
                     )
                 if ep_group.rank() == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
-                        "max_tokens=%d, balancedness=%.4f, "
+                        "max_tokens=%.0f, balancedness=%.4f, "
                         "steps until the next rearrangement: %d",
                         self.expert_rearrangement_step,
                         eplb_model_state.model_name,
@@ -700,6 +711,38 @@ class EplbState:
 
         # Update the expert load sliding window
         if not is_dummy:
+            # Dump hot experts per step when VLLM_EP_DUMP_HOT_EXPERTS_FILE is set
+            if envs.VLLM_EP_DUMP_HOT_EXPERTS_FILE:
+                expert_load_pass_list = self._sync_load_pass()
+                if ep_group.rank() == 0:
+                    step = self.expert_rearrangement_step
+                    for expert_load_pass, eplb_model_state in zip(
+                        expert_load_pass_list, self.model_states.values()
+                    ):
+                        phys_to_log = eplb_model_state.physical_to_logical_map
+                        num_logical = eplb_model_state.model.num_logical_experts
+                        num_layers = expert_load_pass.shape[0]
+                        for layer_id in range(num_layers):
+                            logical_load = torch.zeros(
+                                num_logical,
+                                dtype=expert_load_pass.dtype,
+                                device=expert_load_pass.device,
+                            )
+                            logical_load.scatter_add_(
+                                0,
+                                phys_to_log[layer_id].long(),
+                                expert_load_pass[layer_id].float(),
+                            )
+                            hot_expert_ids = (
+                                (logical_load > 0)
+                                .nonzero(as_tuple=True)[0]
+                                .cpu()
+                                .tolist()
+                            )
+                            _dump_hot_experts_to_file(
+                                step, layer_id, hot_expert_ids
+                            )
+
             for eplb_model_state in self.model_states.values():
                 eplb_model_state.expert_load_window[self.expert_load_window_step] = (
                     eplb_model_state.expert_load_pass.clone()
