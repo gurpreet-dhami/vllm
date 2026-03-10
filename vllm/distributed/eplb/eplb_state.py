@@ -94,10 +94,12 @@ def _dump_balancedness_to_file(
 def _dump_hot_experts_to_file(
     step: int,
     layer_id: int,
-    hot_expert_ids: Sequence[int],
+    num_logical_experts: int,
+    hot_expert_mask: Sequence[int],
 ) -> None:
     """Dump hot experts per layer when VLLM_EP_DUMP_HOT_EXPERTS_FILE is set.
-    Format: time, layer_id, all hot experts (comma-separated).
+    Format: time, layer_id, expert_0, expert_1, ..., expert_{N-1}
+    Each column is 1 if that expert is hot, 0 otherwise. Easy to use for heatmaps.
     """
     dump_file = envs.VLLM_EP_DUMP_HOT_EXPERTS_FILE
     if not dump_file:
@@ -107,9 +109,12 @@ def _dump_hot_experts_to_file(
         with open(dump_file, "a", newline="") as f:
             w = csv.writer(f)
             if write_header:
-                w.writerow(["time", "layer_id", "hot_experts"])
-            hot_experts_str = ",".join(str(e) for e in hot_expert_ids)
-            w.writerow([step, layer_id, hot_experts_str])
+                header = ["time", "layer_id"] + [
+                    f"expert_{i}" for i in range(num_logical_experts)
+                ]
+                w.writerow(header)
+            row = [step, layer_id] + list(hot_expert_mask)
+            w.writerow(row)
     except OSError as e:
         logger.warning("Failed to dump hot experts to %s: %s", dump_file, e)
 
@@ -733,14 +738,11 @@ class EplbState:
                                 phys_to_log[layer_id].long(),
                                 expert_load_pass[layer_id].float(),
                             )
-                            hot_expert_ids = (
-                                (logical_load > 0)
-                                .nonzero(as_tuple=True)[0]
-                                .cpu()
-                                .tolist()
+                            hot_expert_mask = (
+                                (logical_load > 0).int().cpu().tolist()
                             )
                             _dump_hot_experts_to_file(
-                                step, layer_id, hot_expert_ids
+                                step, layer_id, num_logical, hot_expert_mask
                             )
 
             for eplb_model_state in self.model_states.values():
