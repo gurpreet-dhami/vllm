@@ -26,9 +26,9 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import atexit
 import csv
 import os
-import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -91,32 +91,49 @@ def _dump_balancedness_to_file(
         logger.warning("Failed to dump balancedness to %s: %s", dump_file, e)
 
 
-def _dump_hot_experts_to_file(
-    step: int,
-    layer_id: int,
-    num_logical_experts: int,
-    hot_expert_mask: Sequence[int],
-) -> None:
-    """Dump hot experts per layer when VLLM_EP_DUMP_HOT_EXPERTS_FILE is set.
-    Format: time, layer_id, expert_0, expert_1, ..., expert_{N-1}
-    Each column is 1 if that expert is hot, 0 otherwise. Easy to use for heatmaps.
-    """
+# Hot experts dump buffer: collect during workload, flush every HOT_EXPERTS_DUMP_INTERVAL steps
+HOT_EXPERTS_DUMP_INTERVAL = 3000
+_hot_experts_dump_buffer: list[tuple[int, int, int, list[int]]] = []
+_hot_experts_dump_registered = False
+
+
+def _hot_experts_flush_to_file() -> None:
+    """Flush buffered hot experts data to file."""
+    global _hot_experts_dump_buffer
     dump_file = envs.VLLM_EP_DUMP_HOT_EXPERTS_FILE
-    if not dump_file:
+    if not dump_file or not _hot_experts_dump_buffer:
         return
     try:
         write_header = not (os.path.exists(dump_file) and os.path.getsize(dump_file) > 0)
         with open(dump_file, "a", newline="") as f:
             w = csv.writer(f)
-            if write_header:
-                header = ["time", "layer_id"] + [
-                    f"expert_{i}" for i in range(num_logical_experts)
-                ]
-                w.writerow(header)
-            row = [step, layer_id] + list(hot_expert_mask)
-            w.writerow(row)
+            for step, layer_id, num_logical_experts, hot_expert_mask in _hot_experts_dump_buffer:
+                if write_header:
+                    header = ["time", "layer_id"] + [
+                        f"expert_{i}" for i in range(num_logical_experts)
+                    ]
+                    w.writerow(header)
+                    write_header = False
+                row = [step, layer_id] + list(hot_expert_mask)
+                w.writerow(row)
     except OSError as e:
         logger.warning("Failed to dump hot experts to %s: %s", dump_file, e)
+    finally:
+        _hot_experts_dump_buffer = []
+
+
+def _hot_experts_buffer_append(
+    step: int, layer_id: int, num_logical_experts: int, hot_expert_mask: list[int]
+) -> None:
+    """Append hot experts data to buffer. Flush every HOT_EXPERTS_DUMP_INTERVAL steps."""
+    global _hot_experts_dump_registered
+    # Flush and clear before adding new 3000-step block
+    if step > 0 and step % HOT_EXPERTS_DUMP_INTERVAL == 0:
+        _hot_experts_flush_to_file()
+    _hot_experts_dump_buffer.append((step, layer_id, num_logical_experts, hot_expert_mask))
+    if not _hot_experts_dump_registered:
+        _hot_experts_dump_registered = True
+        atexit.register(_hot_experts_flush_to_file)
 
 
 @dataclass
@@ -726,8 +743,7 @@ class EplbState:
                     ):
                         phys_to_log = eplb_model_state.physical_to_logical_map
                         num_logical = eplb_model_state.model.num_logical_experts
-                        num_layers = expert_load_pass.shape[0]
-                        for layer_id in range(num_layers):
+                        for layer_id in range(expert_load_pass.shape[0]):
                             logical_load = torch.zeros(
                                 num_logical,
                                 dtype=expert_load_pass.dtype,
@@ -742,7 +758,7 @@ class EplbState:
                             hot_expert_mask = (
                                 (logical_load > 0).int().cpu().tolist()
                             )
-                            _dump_hot_experts_to_file(
+                            _hot_experts_buffer_append(
                                 step, layer_id, num_logical, hot_expert_mask
                             )
 
