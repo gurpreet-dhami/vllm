@@ -2648,15 +2648,15 @@ class GPUModelRunner(
         Also steps for EP-only balancedness dump when EPLB disabled + VLLM_EP_DUMP_BALANCEDNESS=1.
         """
         if not self.parallel_config.enable_eplb:
-            # EP-only: eplb_state exists for balancedness dump when EPLB disabled
-            if (
-                self.eplb_state is not None
-                and os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+            # EP-only: eplb_state exists for balancedness and/or expert token dump
+            if self.eplb_state is not None and (
+                os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+                or os.environ.get("VLLM_EP_DUMP_HOT_EXPERTS_FILE")
             ):
                 self.eplb_state.step(
                     is_dummy,
                     is_profile,
-                    log_stats=True,
+                    log_stats=os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1",
                 )
             return
 
@@ -4276,9 +4276,12 @@ class GPUModelRunner(
             is_mixture_of_experts(self.model)
             and self.parallel_config.enable_expert_parallel
             and not self.parallel_config.enable_eplb
-            and os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+            and (
+                os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+                or os.environ.get("VLLM_EP_DUMP_HOT_EXPERTS_FILE")
+            )
         ):
-            # EP-only balancedness dump when EPLB disabled
+            # EP-only dump when EPLB disabled (balancedness and/or expert token loads)
             self.eplb_state = EplbState(self.parallel_config, self.device)
             self.eplb_state.add_model(
                 self.model,
@@ -4288,8 +4291,11 @@ class GPUModelRunner(
                 None,
             )
             logger.info_once(
-                "EP balancedness dump enabled for model %s (EPLB disabled).",
+                "EP dump enabled for model %s (EPLB disabled): balancedness=%s, "
+                "expert_tokens=%s",
                 self.model_config.model,
+                "yes" if os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1" else "no",
+                "yes" if os.environ.get("VLLM_EP_DUMP_HOT_EXPERTS_FILE") else "no",
             )
 
         if (

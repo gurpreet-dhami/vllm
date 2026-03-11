@@ -1572,8 +1572,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EP_DUMP_BALANCEDNESS": lambda: bool(
         int(os.getenv("VLLM_EP_DUMP_BALANCEDNESS", "0"))
     ),
+    # Interval for balancedness sync/dump. Higher values reduce collective + I/O
+    # overhead that can cause DeepEP "CPU recv timeout".
+    "VLLM_EP_DUMP_BALANCEDNESS_INTERVAL": lambda: int(
+        os.getenv("VLLM_EP_DUMP_BALANCEDNESS_INTERVAL", "500")
+    ),
     "VLLM_EP_DUMP_BALANCEDNESS_FILE": lambda: os.environ.get(
         "VLLM_EP_DUMP_BALANCEDNESS_FILE", "vllm_ep_balancedness_dump.csv"
+    ),
+    # Dump total tokens per expert every N steps. Each dump = sum over those N steps.
+    # When VLLM_EP_DUMP_HOT_EXPERTS_PER_RANK=1: each rank dumps its local view (no
+    # all-reduce); post-process with merge_expert_tokens_dump.py to get global view.
+    "VLLM_EP_DUMP_HOT_EXPERTS_INTERVAL": lambda: int(
+        os.getenv("VLLM_EP_DUMP_HOT_EXPERTS_INTERVAL", "500")
+    ),
+    "VLLM_EP_DUMP_HOT_EXPERTS_PER_RANK": lambda: bool(
+        int(os.getenv("VLLM_EP_DUMP_HOT_EXPERTS_PER_RANK", "0"))
     ),
     "VLLM_EP_DUMP_HOT_EXPERTS_FILE": lambda: os.environ.get(
         "VLLM_EP_DUMP_HOT_EXPERTS_FILE"

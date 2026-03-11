@@ -92,49 +92,85 @@ def _dump_balancedness_to_file(
         logger.warning("Failed to dump balancedness to %s: %s", dump_file, e)
 
 
-# Hot experts dump buffer: collect during workload, flush every HOT_EXPERTS_DUMP_INTERVAL steps
-HOT_EXPERTS_DUMP_INTERVAL = 3000
-_hot_experts_dump_buffer: list[tuple[int, int, int, list[int]]] = []
-_hot_experts_dump_registered = False
+# Expert token load dump buffer: collect during workload, flush only at process exit
+# Each entry: (step, layer_id, num_logical_experts, tokens_per_expert)
+# tokens_per_expert: total token counts per logical expert over the interval
+_expert_tokens_dump_buffer: list[tuple[int, int, int, list[int]]] = []
+_expert_tokens_dump_registered = False
+# Accumulator: (model_idx, layer_id) -> running sum of tokens per expert
+_expert_tokens_agg: dict[tuple[int, int], list[int]] = {}
+_expert_tokens_agg_count: dict[tuple[int, int], int] = {}  # steps accumulated
+_expert_tokens_ep_rank: int | None = None  # stored at first append for atexit
 
 
-def _hot_experts_flush_to_file() -> None:
-    """Flush buffered hot experts data to file."""
-    global _hot_experts_dump_buffer
+def _expert_tokens_flush_to_file() -> None:
+    """Flush buffered expert token load data to file."""
+    global _expert_tokens_dump_buffer, _expert_tokens_agg, _expert_tokens_agg_count, _expert_tokens_ep_rank
     dump_file = envs.VLLM_EP_DUMP_HOT_EXPERTS_FILE
-    if not dump_file or not _hot_experts_dump_buffer:
+    if not dump_file:
         return
+    # Flush any remaining accumulated data
+    for (model_idx, layer_id), tokens_sum in _expert_tokens_agg.items():
+        if tokens_sum:
+            num_logical = len(tokens_sum)
+            _expert_tokens_dump_buffer.append((-1, layer_id, num_logical, tokens_sum))
+    _expert_tokens_agg = {}
+    _expert_tokens_agg_count = {}
+    if not _expert_tokens_dump_buffer:
+        return
+    # Per-rank mode: append _rank{N} before .csv
+    if envs.VLLM_EP_DUMP_HOT_EXPERTS_PER_RANK:
+        ep_rank = _expert_tokens_ep_rank if _expert_tokens_ep_rank is not None else 0
+        base, ext = os.path.splitext(dump_file)
+        dump_file = f"{base}_rank{ep_rank}{ext}"
     try:
         write_header = not (os.path.exists(dump_file) and os.path.getsize(dump_file) > 0)
         with open(dump_file, "a", newline="") as f:
             w = csv.writer(f)
-            for step, layer_id, num_logical_experts, hot_expert_mask in _hot_experts_dump_buffer:
+            for step, layer_id, num_logical_experts, tokens_per_expert in _expert_tokens_dump_buffer:
                 if write_header:
                     header = ["time", "layer_id"] + [
                         f"expert_{i}" for i in range(num_logical_experts)
                     ]
                     w.writerow(header)
                     write_header = False
-                row = [step, layer_id] + list(hot_expert_mask)
+                row = [step, layer_id] + list(tokens_per_expert)
                 w.writerow(row)
     except OSError as e:
-        logger.warning("Failed to dump hot experts to %s: %s", dump_file, e)
+        logger.warning("Failed to dump expert tokens to %s: %s", dump_file, e)
     finally:
-        _hot_experts_dump_buffer = []
+        _expert_tokens_dump_buffer = []
 
 
-def _hot_experts_buffer_append(
-    step: int, layer_id: int, num_logical_experts: int, hot_expert_mask: list[int]
+def _expert_tokens_accumulate_and_maybe_dump(
+    step: int,
+    layer_id: int,
+    num_logical_experts: int,
+    tokens_per_expert: list[int],
+    model_idx: int,
+    interval: int,
+    ep_rank: int | None = None,
 ) -> None:
-    """Append hot experts data to buffer. Flush every HOT_EXPERTS_DUMP_INTERVAL steps."""
-    global _hot_experts_dump_registered
-    # Flush and clear before adding new 3000-step block
-    if step > 0 and step % HOT_EXPERTS_DUMP_INTERVAL == 0:
-        _hot_experts_flush_to_file()
-    _hot_experts_dump_buffer.append((step, layer_id, num_logical_experts, hot_expert_mask))
-    if not _hot_experts_dump_registered:
-        _hot_experts_dump_registered = True
-        atexit.register(_hot_experts_flush_to_file)
+    """Accumulate tokens over steps. Dump total every `interval` steps."""
+    global _expert_tokens_dump_buffer, _expert_tokens_dump_registered, _expert_tokens_agg, _expert_tokens_agg_count, _expert_tokens_ep_rank
+    if ep_rank is not None and _expert_tokens_ep_rank is None:
+        _expert_tokens_ep_rank = ep_rank
+    key = (model_idx, layer_id)
+    if key not in _expert_tokens_agg:
+        _expert_tokens_agg[key] = [0] * num_logical_experts
+        _expert_tokens_agg_count[key] = 0
+    for i in range(num_logical_experts):
+        _expert_tokens_agg[key][i] += tokens_per_expert[i]
+    _expert_tokens_agg_count[key] += 1
+    if _expert_tokens_agg_count[key] >= interval:
+        tokens_sum = _expert_tokens_agg.pop(key)
+        _expert_tokens_agg_count.pop(key)
+        _expert_tokens_dump_buffer.append(
+            (step, layer_id, num_logical_experts, tokens_sum)
+        )
+    if not _expert_tokens_dump_registered:
+        _expert_tokens_dump_registered = True
+        atexit.register(_expert_tokens_flush_to_file)
 
 
 @dataclass
@@ -684,12 +720,14 @@ class EplbState:
             for eplb_model_state in self.model_states.values():
                 eplb_model_state.expert_load_pass.zero_()
 
-        if (
-            log_stats
-            and self.expert_rearrangement_step
-            % self.parallel_config.eplb_config.log_balancedness_interval
-            == 0
-        ):
+        # Use VLLM_EP_DUMP_BALANCEDNESS_INTERVAL when dump enabled to avoid
+        # _sync_load_pass + file I/O every step (causes DeepEP "CPU recv timeout").
+        log_interval = self.parallel_config.eplb_config.log_balancedness_interval
+        if envs.VLLM_EP_DUMP_BALANCEDNESS:
+            log_interval = max(
+                log_interval, envs.VLLM_EP_DUMP_BALANCEDNESS_INTERVAL
+            )
+        if log_stats and self.expert_rearrangement_step % log_interval == 0:
             # Sync the expert load pass for each model (main and drafter).
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
@@ -734,14 +772,18 @@ class EplbState:
 
         # Update the expert load sliding window
         if not is_dummy:
-            # Dump hot experts per step when VLLM_EP_DUMP_HOT_EXPERTS_FILE is set
+            # Dump expert token loads when VLLM_EP_DUMP_HOT_EXPERTS_FILE is set.
+            per_rank = envs.VLLM_EP_DUMP_HOT_EXPERTS_PER_RANK
             if envs.VLLM_EP_DUMP_HOT_EXPERTS_FILE:
-                expert_load_pass_list = self._sync_load_pass()
-                if ep_group.rank() == 0:
-                    step = self.expert_rearrangement_step
-                    for expert_load_pass, eplb_model_state in zip(
-                        expert_load_pass_list, self.model_states.values()
+                interval = max(1, envs.VLLM_EP_DUMP_HOT_EXPERTS_INTERVAL)
+                step = self.expert_rearrangement_step
+                if per_rank:
+                    # Per-rank mode: use local expert_load_pass, no all-reduce.
+                    # Each rank dumps its own view; post-process to merge.
+                    for model_idx, eplb_model_state in enumerate(
+                        self.model_states.values()
                     ):
+                        expert_load_pass = eplb_model_state.expert_load_pass
                         phys_to_log = eplb_model_state.physical_to_logical_map
                         num_logical = eplb_model_state.model.num_logical_experts
                         for layer_id in range(expert_load_pass.shape[0]):
@@ -756,12 +798,49 @@ class EplbState:
                                 phys_to_log[layer_id].long(),
                                 layer_load.to(logical_load.dtype),
                             )
-                            hot_expert_mask = (
-                                (logical_load > 0).int().cpu().tolist()
+                            tokens_per_expert = logical_load.cpu().tolist()
+                            _expert_tokens_accumulate_and_maybe_dump(
+                                step,
+                                layer_id,
+                                num_logical,
+                                tokens_per_expert,
+                                model_idx=model_idx,
+                                interval=interval,
+                                ep_rank=ep_group.rank(),
                             )
-                            _hot_experts_buffer_append(
-                                step, layer_id, num_logical, hot_expert_mask
+                else:
+                    # Global mode: all-reduce every step, rank 0 dumps.
+                    expert_load_pass_list = self._sync_load_pass()
+                    if ep_group.rank() == 0:
+                        for model_idx, (expert_load_pass, eplb_model_state) in enumerate(
+                            zip(
+                                expert_load_pass_list,
+                                self.model_states.values(),
                             )
+                        ):
+                            phys_to_log = eplb_model_state.physical_to_logical_map
+                            num_logical = eplb_model_state.model.num_logical_experts
+                            for layer_id in range(expert_load_pass.shape[0]):
+                                logical_load = torch.zeros(
+                                    num_logical,
+                                    dtype=expert_load_pass.dtype,
+                                    device=expert_load_pass.device,
+                                )
+                                layer_load = expert_load_pass[layer_id]
+                                logical_load.scatter_add_(
+                                    0,
+                                    phys_to_log[layer_id].long(),
+                                    layer_load.to(logical_load.dtype),
+                                )
+                                tokens_per_expert = logical_load.cpu().tolist()
+                                _expert_tokens_accumulate_and_maybe_dump(
+                                    step,
+                                    layer_id,
+                                    num_logical,
+                                    tokens_per_expert,
+                                    model_idx=model_idx,
+                                    interval=interval,
+                                )
 
             for eplb_model_state in self.model_states.values():
                 eplb_model_state.expert_load_window[self.expert_load_window_step] = (

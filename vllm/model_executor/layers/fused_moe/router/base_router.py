@@ -165,7 +165,7 @@ class BaseRouter(FusedMoERouter):
                 logical_to_physical_map=self.eplb_state.logical_to_physical_map,
                 logical_replica_count=self.eplb_state.logical_replica_count,
             )
-        # EP-only: record load for balancedness dump when EPLB disabled
+        # EP-only: record load for balancedness or expert token dump when EPLB disabled
         if (
             not self.enable_eplb
             and self.eplb_state is not None
@@ -174,7 +174,10 @@ class BaseRouter(FusedMoERouter):
             and self.eplb_state.logical_replica_count is not None
         ):
             import os
-            if os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1":
+            if (
+                os.environ.get("VLLM_EP_DUMP_BALANCEDNESS", "0") == "1"
+                or os.environ.get("VLLM_EP_DUMP_HOT_EXPERTS_FILE")
+            ):
                 return eplb_map_to_physical_and_record(
                     topk_ids=topk_ids,
                     expert_load_view=self.eplb_state.expert_load_view,
